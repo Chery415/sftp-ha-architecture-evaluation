@@ -1,27 +1,43 @@
 # 企業級高可用 SFTPGo 系統備份與災難復原 (DR) 規劃報告
 
-## 一、 執行摘要與設計目標
+> **文件版本**：v2.0（正式環境落地版）  
+> **適用架構**：Keepalived + HAProxy + SFTPGo (Active-Active) + MinIO S3 + PostgreSQL HA  
+> **編制目的**：針對產線環境規劃整體備份架構、備份主機規格配置、防勒索安全機制與災難復原 (DR) 標準作業程序。
 
-本報告針對現有之 **SFTPGo 企業級高可用雙節點叢集**（整合 Keepalived + HAProxy + SFTPGo Active-Active + MinIO S3 分散式儲存 + PostgreSQL 串流複寫）量身規劃實作可落地的全方位備份與災難復原架構。
+---
 
-### 1.1 核心防護原則
-* **HA ≠ 備份**：雙節點高可用（HA）僅防範「單一硬體/節點非預期離線」，但無法防範「人員手滑誤刪、惡意軟體/勒索加密、邏輯改壞、跨機房全區斷電」。
-* **3-2-1-1 備份原則**：
-  * **3** 份資料複本（正式機 A、備援機 B、獨立備份主機）。
-  * **2** 種不同儲存介質（正式叢集高速 SSD + 備份主機獨立儲存池/NAS）。
-  * **1** 份異地/隔離副本（獨立備份機房或冷備儲存）。
-  * **1** 份**不可變備份（Immutable Backup / WORM）**：防範勒索軟體覆寫或內部人員提權竄改。
+## 報告導讀與章節結構
+為了維持高階決策報告的簡潔性與可讀性，本規劃書採用**「主文聚焦架構策略，技術細節拆分附件」**的設計：
+* **第一章至第五章（主要報告）**：核心防護目標、備份資產清單、**備份主機規格與容量規劃**、四步災難復原標準程序。
+* **附件 A（技術原理與觀念解析）**：`mc mirror`、`pg_dump`、`tar.gz` 深度原理說明與選型原因。
+* **附件 B（自動化維運腳本庫）**：可直接佈署至備份主機的自動化 Pull 備份與清理腳本。
+* **附件 C（災難復原快速指令對照表）**：極限災難時供工程師快速查閱之還原指令清單。
+
+---
+
+## 一、 核心防護原則與服務水準目標 (SLA)
+
+### 1.1 核心防禦哲學
+* **「HA 高可用 ≠ 備份」**：
+  雙節點主備（Active-Active / Active-Standby）僅能防禦「單一伺服器硬體故障」，容錯切換以秒計；若遭遇**人員誤刪、惡意程式/勒索加密、邏輯改壞**，高可用機制會將錯誤在數秒內同步至另一節點。獨立離線的備份主機是企業最後的生存防線。
+* **落實 3-2-1-1 防勒索備份原則**：
+  * **3** 份資料副本（正式機 A、備援機 B、獨立備份主機）。
+  * **2** 種不同儲存介質（正式叢集高速 SSD 陣列 + 備份主機獨立儲存池）。
+  * **1** 份異地/冷儲存副本（實體隔離機房或獨立雲端儲存槽）。
+  * **1** 份**不可變備份 (WORM / Immutable)**：檔案寫入後鎖定，任何帳號（含 Root）在保留期內皆無法篡改或刪除。
 
 ### 1.2 服務水準目標 (SLA)
-| 指標 | 目標值 | 說明 |
+| 關鍵指標 | 目標值 | 業務衝擊與意義 |
 | :--- | :--- | :--- |
-| **RPO (復原點目標)** | **< 1 小時** (檔案) / **< 15 分鐘** (DB) | 發生災難時，最多容忍損失的資料時間跨度。 |
-| **RTO (復原時間目標)** | **< 30 分鐘** (全站滅頂重建) | 從全新伺服器開機到完全恢復 SFTP 服務對外營運的時間。 |
-| **商務衝擊防護** | **零告警無縫復原** | 復原後外部客戶端（WinSCP、銀行批次排程）**不跳出 SSH Key 變更警告**。 |
+| **RPO (復原點目標)** | **< 1 小時** (檔案) / **< 15 分鐘** (DB) | 系統發生災難時，最多容忍損失的資料時間跨度。 |
+| **RTO (復原時間目標)** | **< 30 分鐘** (全站滅頂重建) | 從全新空機開機到完全恢復 SFTP 服務對外營運的時間。 |
+| **商務無感指標** | **零告警無縫復原** | 復原後外部客戶（銀行、供應商排程）**不跳出 SSH Key 變更警告**。 |
 
 ---
 
 ## 二、 備份資產清單與策略矩陣
+
+整套 SFTPGo 系統的所有資產，依其資料特性被歸納為三大備份組別：
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -39,280 +55,203 @@
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-| 資產分類 | 具體路徑 / 來源 | 備份頻率 | 備份方式 | 關鍵目的 |
-| :--- | :--- | :--- | :--- | :--- |
-| **① 實體檔案 (MinIO S3)** | MinIO Bucket (`sftp-data`) | 每日 02:00 (增量) / 即時非同步複寫 | `mc mirror --overwrite` | 防止客戶上傳/存放之重要業務檔案遺失。 |
-| **② 帳號與策略 (PostgreSQL)** | PostgreSQL `sftpgo` 資料庫 | 每日 01:00 / 03:00 (全備) | `docker exec pg_dump -Fc` | 保留使用者清單、密碼雜湊、S3路徑映射、配額、IP白名單。 |
-| **③ 主機指紋 (SSH Host Keys)** | `/var/lib/sftpgo/id_*` | 變更時 / 每日隨組態打包 | `tar -czf hostkeys.tar.gz` | **極關鍵：避免全站重建後外部客戶端彈出「中間人攻擊」警告中斷批次連線。** |
-| **④ 邊界網路與編排組態** | `config/`、`docker-compose.yml` | 變更時 / 每日打包 | Git 典藏 + 備份主機複寫 | 快速拉起 HAProxy、Keepalived VIP 與容器拓撲。 |
-| **⑤ 環境變數與加密密鑰** | `.env`、Secretbox 金鑰 | 變更時 (極機密保存) | GPG 加密後異地備份 | 確保還原時 DB 密碼、S3 Access Key 與內部加密一致。 |
-| **⑥ 傳輸與防護日誌** | 容器日誌 stdout / Defender | 每小時串流 / 每日輪替 | Vector / Docker 日誌轉存 | 法規遵循（ISO 27001、GDPR）、資安事件鑑識與防賴帳舉證。 |
+| 組別 | 項目名稱 | 儲存位置 | 備份頻率 | 推薦工具與格式 | 關鍵防護目的 |
+| :---: | :--- | :--- | :---: | :---: | :--- |
+| **A** | **使用者實體檔案** | MinIO Bucket (`sftp-data`) | 每日凌晨 (增量) / 即時 | `mc mirror` (檔案鏡像) | 保存所有客戶上傳、存放之實體業務檔案。 |
+| **B** | **帳號策略資料庫** | PostgreSQL (`sftpgo` DB) | 每日凌晨 (全備) | `pg_dump -Fc` (二進位自訂) | 保存帳號密碼雜湊、S3路徑映射、目錄權限與配額。 |
+| **C** | **主機指紋與金鑰** | `/var/lib/sftpgo/id_*` | 變更時 / 每日隨組態 | `tar.gz` (封存 Linux 權限) | **極關鍵：避免全站重建後客戶端跳出「中間人攻擊」警告。** |
+| **C** | **網路邊界組態** | HAProxy / Keepalived / `.env` | 變更時 (Git/每日) | `tar.gz` (機密加密保存) | 1 分鐘內快速重現 VIP、負載平衡與連線密碼。 |
 
 ---
 
-## 三、 安全防護架構：防勒索與「拉取（Pull）」模式
+## 三、 專用備份主機（Backup Host）規劃做法
 
-> [!CAUTION]
-> **傳統推送 (Push) 備份的致命風險**：
-> 若在正式機寫腳本透過 SSH 連線並將檔案 `scp` 或 `rsync` 到備份主機，正式機勢必儲存登入備份機的憑證。一旦正式機被駭客攻陷或遭受勒索軟體加密，攻擊者會利用該憑證登入備份機，將所有備份一網打盡！
+很多維運規劃的誤區是認為「備份 MinIO 就必須再架一套 MinIO；備份 PostgreSQL 就必須再裝一套資料庫」。本規劃採用**輕量化解耦架構**，備份主機僅需扮演「安全檔案庫與任務調度者」。
 
-### 落地解決方案：由「備份主機」發動 Pull 作業
-```
-[正式機叢集 (PROD)]               [獨立備份主機 (BACKUP-SERVER)]
-┌──────────────────┐               ┌───────────────────────────────┐
-│ • MinIO API      │ <──────Pull── │ 1. 執行 mc mirror 拉取 S3 物件 │
-│ • SSH (僅限唯讀) │ <──────Pull── │ 2. SSH 執行唯讀 dump 並拉取   │
-│ (無備份機存取權) │               │ 3. 設定 WORM (chattr +i) 鎖定 │
-└──────────────────┘               └───────────────────────────────┘
-```
-1. **單向存取原則**：正式機「完全不知道備份機的 IP 與帳密」，正式機上無任何登入備份機的私鑰。
-2. **最小權限原則**：備份機使用專屬唯讀帳號（PostgreSQL 唯讀帳號、MinIO 唯讀 Policy）拉取資料。
-3. **不可變備份 (WORM / Immutable)**：備份寫入備份伺服器後，利用 Linux `chattr +i`（或 S3 Object Lock）鎖定 7 天，即便 Root 也無法立即刪除或竄改。
+### 3.1 備份主機硬體與軟體規格建議
+* **作業系統**：標準 Linux（Ubuntu 22.04 LTS / Rocky Linux 9 / RHEL 9 皆可）。
+* **運算資源**：低負載（建議配置 4 核心 CPU、8GB ~ 16GB RAM）。
+* **網路頻寬**：具備 1Gbps ~ 10Gbps 內部局域網路，確保夜間大量資料同步不塞車。
+* **軟體需求**：
+  * **不需要安裝**：PostgreSQL Server、Docker 引擎、MinIO Server。
+  * **僅需安裝**：`mc`（MinIO Client 單一執行檔）、`openssh-client`、`cron`，以及選配之 `postgresql-client`（用於預覽 dump 內容）。
+
+### 3.2 儲存容量預估與磁碟配置
+備份主機儲存空間分為三大分區：
+1. **MinIO 物件鏡像區**：配置正式環境儲存量的 **1.2 ~ 1.5 倍**（因不刪除過期誤刪檔，預留歷史緩衝空間）。
+2. **PostgreSQL DB 備份區**：配置 **20GB ~ 50GB**（單次 dump 僅數十 MB，自定義格式壓縮率極高，足夠保存一整年歷史備份）。
+3. **組態與金鑰區**：小於 **1GB**（`tar.gz` 打包後單檔僅數十 KB）。
+* **磁碟保護建議**：採用硬體 RAID 1 或 RAID 5/6 陣列，避免備份主機本身因單顆硬碟損壞而失效。
+
+### 3.3 安全防禦架構（防勒索與權限最小化）
+1. **單向「拉取 (Pull)」機制**：
+   * 正式機上**嚴禁存放登入備份機的 SSH Key 或密碼**。
+   * 由備份主機透過專用排程，使用**唯讀帳號**主動向正式機拉取資料。即便正式機全區遭駭客控制，攻擊者也無法逆向存取備份主機。
+2. **存取權限嚴格隔離**：
+   * 備份目錄執行權限封鎖：`chmod 700 /backup/sftp-configs`，僅限 `root` 或專用 `backup-runner` 帳號存取，嚴防 `.env` 密鑰外流。
+3. **不可變備份 (WORM 鎖定)**：
+   * 備份寫入後，系統腳本自動執行 `chattr +i` 將歷史封存檔鎖定 7 天。
 
 ---
 
-## 四、 實作落地指南：自動化備份腳本清單
+## 四、 災難復原黃金律則 (DR SOP)
 
-在**【獨立備份主機】**建立自動化維運目錄：
+當遭遇最嚴重的全站毀滅事件（例如硬體全損，在新主機全新部署）時，請務必恪守以下**標準四步復原順序**：
+
 ```
-/opt/sftp-backup/
-├── scripts/
-│   ├── backup-db-and-configs.sh    # 資料庫、金鑰、設定檔拉取
-│   ├── backup-minio-storage.sh     # MinIO 檔案增量鏡像
-│   └── enforce-retention.sh        # 保留週期輪替與過期刪除
-├── data/
-│   ├── db/                         # PostgreSQL 備份檔 (*.dump)
-│   ├── configs/                    # Host Keys 與組態檔 (*.tar.gz)
-│   ├── storage/                    # MinIO 鏡像複本
-│   └── logs/                       # 備份執行歷程記錄
-└── sftp-backup.env                 # 連線參數與金鑰設定
+[步驟 1: 先灌實體檔案] ──> [步驟 2: 注入金鑰與組態] ──> [步驟 3: 還原資料庫] ──> [步驟 4: 啟動運算服務]
+ (MinIO S3 檔案就緒)       (SSH Host Keys 600)       (帳號與權限映射復原)     (SFTPGo/HAProxy 上線)
 ```
 
-### 4.1 腳本一：資料庫、SSH Host Keys 與組態備份 (`backup-db-and-configs.sh`)
+> [!IMPORTANT]
+> **為什麼順序不能顛倒？**
+> 若先啟動 SFTPGo 才放檔案，SFTPGo 啟動時掃描 S3 會發現是空目錄，可能導致使用者容量配額計算異常或觸發遺失告警。先讓「實體檔案」與「資料庫」就緒，最後拉起 SFTPGo，服務即可在秒級內平穩接管。
 
+1. **第一步（檔案還原）**：啟動新 MinIO 容器，在備份主機執行 `mc mirror` 反向同步，將本地目錄檔案全數灌回新 S3 Bucket。
+2. **第二步（指紋還原）**：將備份的 `sftpgo_hostkeys.tar.gz` 倒回 Docker Volume，確保主機指紋不變且維持 `chmod 600`。
+3. **第三步（大腦還原）**：啟動 PostgreSQL，執行 `pg_restore -d sftpgo`，瞬間還原所有帳號、密碼雜湊與 S3 映射。
+4. **第四步（服務上線）**：啟動 `sftpgo-a`、`sftpgo-b` 與 HAProxy / Keepalived，執行自動化驗證腳本確認對外服務。
+
+---
+
+## 五、 維運排程與健全度監控
+
+### 5.1 備份排程規劃
+* **01:30**：執行資料庫 `pg_dump`、SSH Host Keys 與組態打包（產生 SHA256 校驗碼）。
+* **02:30**：執行 MinIO S3 物件增量鏡像同步（離峰時間傳輸）。
+* **04:00**：執行過期備份清理與保留週期輪替（7天日備、4週週備、12月月備）。
+
+### 5.2 整合現有 Zabbix 監控告警
+* **備份檔新鮮度監控**：Zabbix 監控備份目錄檔案修改時間，若超過 26 小時未產生新備份，立即觸發 High 告警。
+* **備份檔大小異常監控**：監控 `.dump` 檔案大小，若小於 1MB（可能 dump 失敗產出空檔），觸發嚴重警告。
+* **每季定期無痛還原演練**：每季在隔離測試環境執行一次自動化拉起還原，驗證備份檔可讀性。
+
+---
+
+## 附件 A：關鍵技術原理與深度解析 (Glossary & Deep Dive)
+
+### A.1 `mc mirror` 深度解析
+* **它是什麼？**
+  `mc` 是 MinIO 官方命令列管理工具（MinIO Client），`mc mirror` 則是物件儲存世界的 `rsync`。
+* **運作原理**：
+  它會自動比對來源端與目的端的物件名稱、檔案大小、最後修改時間與 ETag 校驗碼，**僅傳輸新增或異動過的檔案**。
+* **為什麼備份端不需要裝 MinIO？**
+  `mc mirror` 具備雙重轉換能力，它可以直接將遠端的 S3 物件儲存桶「原樣轉譯」成一般作業系統上的普通檔案與目錄結構。備份主機上的檔案直接用一般的 `ls` 或檔案總管就能開啟檢閱。
+
+### A.2 `pg_dump` 深度解析
+* **它是什麼？**
+  PostgreSQL 官方原生邏輯備份工具。它透過建立單一交易唯讀快照（Snapshot Isolation），在**完全不中斷產線線上交易**的前提下，將資料表結構與資料列導出。
+* **為什麼指名採用自訂二進位格式 (`-F c`)？**
+  `pg_dump` 支援純文字 (`.sql`) 與二進位自訂格式 (`-F c`)。自訂格式內建壓縮索引，不僅檔案體積極小，更能在災後透過 `pg_restore` 啟用多執行緒（並行加速）還原，甚至能選擇性只還原特定使用者或資料表。
+
+### A.3 `tar.gz` 深度解析
+* **它是什麼？**
+  `tar`（Tape Archive）負責將多個零碎檔案封裝保留目錄樹狀結構；`gz`（gzip）則負責進行資料壓縮。
+* **為什麼不用普通 ZIP？**
+  SSH 私鑰（如 `id_rsa`）在 Linux 安全規範下**強制要求 600 權限（唯獨擁有者可讀寫）**。若使用普通 zip 備份，Linux 檔案權限會遺失變為開放的 `777` 或 `644`，災後 SFTPGo 會判定金鑰不安全而直接拒絕啟動。`tar.gz` 能 100% 封存 Linux 原生權限與 UID/GID，確保解壓縮即開箱可用。
+
+---
+
+## 附件 B：自動化維運腳本庫 (Scripts Library)
+
+以下三支腳本部署於**【備份主機】**的 `/opt/sftp-backup/scripts/` 目錄：
+
+### B.1 資料庫與金鑰組態備份腳本 (`backup-db-and-configs.sh`)
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 載入環境變數
 source /opt/sftp-backup/sftp-backup.env
-
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-DATE_DAY=$(date +"%Y%m%d")
-LOG_FILE="/opt/sftp-backup/data/logs/backup_${DATE_DAY}.log"
 BACKUP_DB_DIR="/opt/sftp-backup/data/db"
 BACKUP_CFG_DIR="/opt/sftp-backup/data/configs"
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"
-}
-
-log "================== 開始執行 DB & 組態備份作業 =================="
-
-# 1. 透過 SSH 呼叫正式機 primary 執行 pg_dump (自定義壓縮格式 -Fc)
-log ">>> [1/3] 正在由 PostgreSQL 導出 sftpgo 資料庫..."
+# 1. SSH 呼叫正式機 PostgreSQL 執行 pg_dump
 ssh -i "${PROD_SSH_KEY}" -p "${PROD_SSH_PORT}" "${PROD_SSH_USER}@${PROD_HOST}" \
   "docker exec pg-primary pg_dump -U sftpgo -d sftpgo -F c -b -v" > "${BACKUP_DB_DIR}/sftpgo_db_${TIMESTAMP}.dump"
 
-DB_SIZE=$(du -h "${BACKUP_DB_DIR}/sftpgo_db_${TIMESTAMP}.dump" | cut -f1)
-log ">>> 資料庫備份成功！檔案大小: ${DB_SIZE}"
-
-# 2. 拉取 SFTPGo 節點中的 SSH Host Keys (關鍵指紋資產)
-log ">>> [2/3] 正在拉取 SFTPGo SSH Host Keys..."
+# 2. 封裝 SSH Host Keys (保持 600 權限)
 ssh -i "${PROD_SSH_KEY}" -p "${PROD_SSH_PORT}" "${PROD_SSH_USER}@${PROD_HOST}" \
   "docker run --rm -v sftp-ha-lab_sftpgo-a-data:/v alpine tar -cz -C /v id_rsa id_rsa.pub id_ed25519 id_ed25519.pub id_ecdsa id_ecdsa.pub" \
   > "${BACKUP_CFG_DIR}/sftpgo_hostkeys_${TIMESTAMP}.tar.gz"
 
-# 3. 拉取 HAProxy, Keepalived, Docker Compose 設定檔
-log ">>> [3/3] 正在拉取叢集組態檔案..."
+# 3. 打包叢集組態檔與環境變數
 ssh -i "${PROD_SSH_KEY}" -p "${PROD_SSH_PORT}" "${PROD_SSH_USER}@${PROD_HOST}" \
-  "tar -cz -C ${PROD_PROJECT_PATH} docker-compose.yml config/" \
+  "tar -cz -C ${PROD_PROJECT_PATH} docker-compose.yml config/ .env" \
   > "${BACKUP_CFG_DIR}/cluster_configs_${TIMESTAMP}.tar.gz"
 
-# 產生 SHA256 校驗碼
+# 4. 生成 SHA256 校驗碼
 sha256sum "${BACKUP_DB_DIR}/sftpgo_db_${TIMESTAMP}.dump" > "${BACKUP_DB_DIR}/sftpgo_db_${TIMESTAMP}.dump.sha256"
-
-log "================== DB & 組態備份作業順利完成 =================="
 ```
 
----
-
-### 4.2 腳本二：MinIO S3 實體檔案增量鏡像 (`backup-minio-storage.sh`)
-
+### B.2 MinIO S3 實體檔案增量鏡像腳本 (`backup-minio-storage.sh`)
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
 source /opt/sftp-backup/sftp-backup.env
-LOG_FILE="/opt/sftp-backup/data/logs/backup_minio_$(date +'%Y%m%d').log"
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"
-}
-
-log "================== 開始執行 MinIO S3 增量同步作業 =================="
-
-# 設定 MinIO Client (mc) 連線別名
-mc alias set prod-s3 "${PROD_MINIO_ENDPOINT}" "${PROD_MINIO_ACCESS_KEY}" "${PROD_MINIO_SECRET_KEY}" --api S3v4 > /dev/null
-
 TARGET_DIR="/opt/sftp-backup/data/storage/sftp-bucket-mirror"
 mkdir -p "${TARGET_DIR}"
 
-# 執行增量鏡像同步
-# 備註：故意不使用 --remove，以防止正式機檔案若遭受誤刪或勒索加密時，備份端不會立即同步刪除舊檔
-log ">>> 正在進行 S3 Bucket 增量同步..."
-mc mirror --overwrite prod-s3/sftp-data "${TARGET_DIR}/" | tee -a "${LOG_FILE}"
+# 設定 MinIO Client 連線別名
+mc alias set prod-s3 "${PROD_MINIO_ENDPOINT}" "${PROD_MINIO_ACCESS_KEY}" "${PROD_MINIO_SECRET_KEY}" --api S3v4 > /dev/null
 
-log ">>> MinIO S3 同步完成。目前儲存體總容量:"
-du -sh "${TARGET_DIR}" | tee -a "${LOG_FILE}"
-log "================== MinIO S3 同步作業結束 =================="
+# 執行增量鏡像 (不加 --remove 以保留正式機誤刪之歷史緩衝)
+mc mirror --overwrite prod-s3/sftp-data "${TARGET_DIR}/"
 ```
 
----
-
-### 4.3 腳本三：保留週期輪替與防勒索鎖定 (`enforce-retention.sh`)
-
+### B.3 保留週期輪替清理腳本 (`enforce-retention.sh`)
 ```bash
 #!/usr/bin/env bash
-# 保留策略：
-# - 最近 7 天的每日備份 (Daily) 完整保留
-# - 最近 4 週的每週日備份 (Weekly) 保留
-# - 最近 12 個月的每月 1 號備份 (Monthly) 保留
-# - 365 天以前的舊檔自動封存或清除
-
 BACKUP_DB_DIR="/opt/sftp-backup/data/db"
 BACKUP_CFG_DIR="/opt/sftp-backup/data/configs"
 
-# 清理 7 天以上且不是週日(Day 0)的日備份
+# 刪除 7 天以上且非每週日、非每月 1 號的日備份
 find "${BACKUP_DB_DIR}" -type f -name "*.dump" -mtime +7 | while read -r file; do
     file_date=$(stat -c %y "$file" | cut -d' ' -f1)
     day_of_week=$(date -d "$file_date" +%u)
     day_of_month=$(date -d "$file_date" +%d)
-
-    # 如果既不是週日 (7)，也不是每月 1 號 (01)，則刪除
     if [ "$day_of_week" -ne 7 ] && [ "$day_of_month" -ne "01" ]; then
         rm -f "$file" "$file.sha256"
     fi
 done
 
-# 清理 30 天以上且不是每月 1 號的週備份
-find "${BACKUP_DB_DIR}" -type f -name "*.dump" -mtime +30 | while read -r file; do
-    file_date=$(stat -c %y "$file" | cut -d' ' -f1)
-    day_of_month=$(date -d "$file_date" +%d)
-    if [ "$day_of_month" -ne "01" ]; then
-        rm -f "$file" "$file.sha256"
-    fi
-done
-
-# 清理超過 365 天的所有舊備份
+# 刪除 365 天以前的所有過期歷史檔
 find "${BACKUP_DB_DIR}" -type f -name "*.dump" -mtime +365 -delete
 find "${BACKUP_CFG_DIR}" -type f -name "*.tar.gz" -mtime +365 -delete
 ```
 
 ---
 
-### 4.4 備份主機 Crontab 排程設定範例
+## 附件 C：災難重建快速操作手冊 (DR Fast Recovery Runbook)
 
-在備份主機上的 `crontab -e` 加入：
-```cron
-# 每日凌晨 01:30 執行資料庫、SSH Host Keys 與組態備份
-30 1 * * * /opt/sftp-backup/scripts/backup-db-and-configs.sh >> /opt/sftp-backup/data/logs/cron.log 2>&1
+當在全新機器進行緊急災難重建時，工程師可直接依序執行下列指令：
 
-# 每日凌晨 02:30 執行 MinIO S3 實體檔案增量鏡像
-30 2 * * * /opt/sftp-backup/scripts/backup-minio-storage.sh >> /opt/sftp-backup/data/logs/cron.log 2>&1
-
-# 每日凌晨 04:00 執行過期備份清理與保留週期輪替
-00 4 * * * /opt/sftp-backup/scripts/enforce-retention.sh >> /opt/sftp-backup/data/logs/cron.log 2>&1
-```
-
----
-
-## 五、 災難復原標準作業程序 (DR Runbook / SOP)
-
-> [!IMPORTANT]
-> **災難復原核心黃金律則**：
-> 1. **先還原實體檔案 (MinIO)**
-> 2. **再還原組態與金鑰 (Host Keys / Configs)**
-> 3. **接著還原資料庫 (PostgreSQL)**
-> 4. **最後才啟動 SFTPGo 服務節點**
-> 
-> *若順序顛倒（先開 SFTPGo 再放檔案），SFTPGo 初始化時會發現後端 S3 空白，可能引發配額重新計算錯誤或發出虛假的檔案遺失告警。*
-
-### 演練情境：正式機房全毀，於新環境全新復原
-
-#### 步驟 1：新主機環境初始化
-在新機器（或 DR 備援機）安裝 Docker 與 Docker Compose：
 ```bash
-# 建立專案目錄
-mkdir -p /opt/sftp-ha-lab
-cd /opt/sftp-ha-lab
-```
+# 【步驟 1：建立專案目錄並解壓縮組態】
+mkdir -p /opt/sftp-ha-lab && cd /opt/sftp-ha-lab
+tar -xzf /backup-path/cluster_configs_latest.tar.gz -C /opt/sftp-ha-lab/
 
-#### 步驟 2：還原組態檔案與 SSH 主機金鑰
-```bash
-# 1. 解壓縮組態檔 (docker-compose.yml, config/)
-tar -xzf /backup-source/cluster_configs_latest.tar.gz -C /opt/sftp-ha-lab/
-
-# 2. 建立 SFTPGo 專屬 Volume 並還原 Host Keys
+# 【步驟 2：原樣還原 SSH Host Keys 至 Docker Volume】
 docker volume create sftp-ha-lab_sftpgo-a-data
 docker volume create sftp-ha-lab_sftpgo-b-data
+docker run --rm -v sftp-ha-lab_sftpgo-a-data:/v -v /backup-path:/b alpine tar -xzf /b/sftpgo_hostkeys_latest.tar.gz -C /v
+docker run --rm -v sftp-ha-lab_sftpgo-b-data:/v -v /backup-path:/b alpine tar -xzf /b/sftpgo_hostkeys_latest.tar.gz -C /v
 
-# 還原 Host Keys 至兩個節點（保證指紋完全不變！）
-docker run --rm -v sftp-ha-lab_sftpgo-a-data:/v -v /backup-source:/b alpine tar -xzf /b/sftpgo_hostkeys_latest.tar.gz -C /v
-docker run --rm -v sftp-ha-lab_sftpgo-b-data:/v -v /backup-source:/b alpine tar -xzf /b/sftpgo_hostkeys_latest.tar.gz -C /v
-```
-
-#### 步驟 3：啟動並還原 MinIO S3 實體檔案
-```bash
-# 1. 僅啟動 MinIO 服務節點
+# 【步驟 3：啟動 MinIO 並將 S3 檔案反向灌回】
 docker compose up -d minio-a minio-b
-
-# 2. 等待 MinIO 健康檢查通過
 sleep 10
-
-# 3. 透過 mc mirror 將備份檔案全數灌回 MinIO
 mc alias set dr-minio http://localhost:9001 minioadmin minioadminpassword
 mc mb --ignore-existing dr-minio/sftp-data
-mc mirror /backup-source/sftp-bucket-mirror/ dr-minio/sftp-data/
-```
+mc mirror --overwrite /backup-path/sftp-bucket-mirror/ dr-minio/sftp-data/
 
-#### 步驟 4：啟動並還原 PostgreSQL 資料庫
-```bash
-# 1. 啟動 PostgreSQL 主要節點
+# 【步驟 4：啟動 PostgreSQL 並匯入資料庫】
 docker compose up -d pg-primary
-
-# 2. 透過 pg_restore 將 dump 檔還原
-docker cp /backup-source/sftpgo_db_latest.dump pg-primary:/tmp/db.dump
+docker cp /backup-path/sftpgo_db_latest.dump pg-primary:/tmp/db.dump
 docker exec pg-primary pg_restore -U sftpgo -d sftpgo --clean --if-exists -v /tmp/db.dump
 docker exec pg-primary rm /tmp/db.dump
-
-# 3. 啟動從節點進行同步
 docker compose up -d pg-standby
-```
 
-#### 步驟 5：啟動前端入口與 SFTPGo 節點
-```bash
-# 啟動負載平衡、VIP 與 SFTPGo 運算節點
+# 【步驟 5：啟動前端入口與 SFTPGo 運算節點】
 docker compose up -d sftpgo-a sftpgo-b sftp-vip-gateway keepalived-master keepalived-backup
 ```
-
-#### 步驟 6：自動化健康檢查與驗證
-直接執行專案內附的容錯與壓力測試腳本，驗證全功能正常：
-```powershell
-# 執行驗證 (可直接於維運機執行本 Lab 現有的測試工具)
-.\test-ha-failover.ps1          # 驗證 VIP 與多節點連線
-.\test-100mb-benchmark.ps1      # 驗證 S3 寫入與大檔傳輸能力
-```
-
----
-
-## 六、 監控、告警與驗證考核機制
-
-1. **Zabbix 備份狀態主動監控**：
-   * 在備份主機安裝 `zabbix-agent2`。
-   * 配置 Item 監控：
-     * `vfs.file.time[/opt/sftp-backup/data/db/sftpgo_db_latest.dump,modify]`：若超過 26 小時未更新，觸發「**嚴重告警：SFTP 資料庫備份中斷**」。
-     * `vfs.file.size[/opt/sftp-backup/data/db/sftpgo_db_latest.dump]`：若備份檔大小低於 1MB（可能 dump 出空檔），觸發告警。
-2. **季定期「無痛還原演練」制度**：
-   * 「未經驗證的備份，視同沒有備份。」
-   * 建議每一季由 IT 維運人員在獨立的隔離測試環境中，執行一次從備份檔進行的【自動化拉起還原測試】，確保備份檔沒有損毀、密碼未過期、還原 SOP 隨時保持最新有效。

@@ -1,4 +1,4 @@
-﻿# 企業級高可用 SFTP 檔案交換平台架構規劃書 (v5.0)
+# 企業級高可用 SFTP 檔案交換平台架構規劃書 (v5.0)
 ## 基於 SFTPGo + MinIO + PostgreSQL + Rocky Linux + Docker 的現代化雲原生方案
 **版本：v5.0 正式修訂版**  
 **更新日期：2026 年 10 月**  
@@ -32,6 +32,12 @@
      * E.1 使用者帳號到期自動化管理機制（生命週期控管與 ISO 27001 合規）
      * E.2 2FA / TOTP 零額外伺服器原理解析（原生 RFC 6238 與雙機容錯）
      * E.3 密碼變更與雙因子安全閉環（防範憑證盜用偷換 TOTP 與復原機制）
+   * [附錄 F：企業級備份架構與災難復原 (DR) 規劃報告](docs/SFTPGo_正式環境備份與災難復原規劃書.md)
+   * [附錄 G：Rocky Linux 雙實體主機 (DMZ) 一鍵自動化安裝手冊與腳本套件](production-deploy/README.md)
+     * [G.1 Rocky Linux 雙實體機 SFTP-HA 安裝部署操作手冊](docs/RockyLinux_雙實體機_SFTP_HA_安裝部署手冊.md)
+     * [G.2 Node 1 Master 一鍵部署腳本套件](production-deploy/node1-master/)
+     * [G.3 Node 2 Backup 一鍵部署腳本套件](production-deploy/node2-backup/)
+     * [G.4 雙機巡檢與故障切換演練工具](production-deploy/tools/)
 
 ---
 
@@ -681,6 +687,38 @@ SFTPGo 針對此痛點提供了原生且全方位的帳號生命週期管理，�
 | **災難復原能力** | 手機遺失需修改底層設定檔或重置整台系統 | 支援緊急復原碼（Recovery Codes）與後台一鍵解綁 | 兼顧嚴密安全性與靈活之 IT 維運支援彈性 |
 
 ---
+
+### 【附錄 F】企業級備份架構與災難復原 (DR) 規劃報告
+
+針對正式環境的長期運維，本專案完整規劃了符合 **3-2-1-1 防勒索備份原則** 的災難復原架構。
+詳細技術規劃與腳本請參閱獨立專題報告：
+👉 **完整文件**：[docs/SFTPGo_正式環境備份與災難復原規劃書.md](docs/SFTPGo_正式環境備份與災難復原規劃書.md)
+
+* **核心亮點**：
+  * **防勒索「拉取 (Pull)」機制**：正式環境不保存備份機憑證，由備份機透過唯讀權限主動排程拉取。
+  * **六大核心資產防護**：MinIO S3 物件增量鏡像 (`mc mirror`)、PostgreSQL 資料庫自訂二進位全備 (`pg_dump -Fc`)、SSH Host Keys 權限鎖定 (`tar.gz`)、HAProxy/Keepalived 組態與稽核日誌。
+  * **專用備份主機規劃**：無須運行 PostgreSQL 與 MinIO，普通 Linux/Windows 磁碟陣列即可輕量收容。
+  * **全自動化腳本**：內建每日自動備份、增量同步與過期自動清理輪替。
+
+---
+
+### 【附錄 G】Rocky Linux 雙實體主機 (DMZ) 一鍵自動化安裝手冊與腳本套件
+
+為方便工程師在公司 DMZ 區域全新安裝的兩台 Rocky Linux 實體主機上快速拉起高可用叢集，本專案特別開發了專屬的自動化安裝部署套件包。
+詳細操作手冊與腳本目錄：
+👉 **部署套件導覽**：[production-deploy/README.md](production-deploy/README.md)  
+👉 **安裝部署 SOP 手冊**：[docs/RockyLinux_雙實體機_SFTP_HA_安裝部署手冊.md](docs/RockyLinux_雙實體機_SFTP_HA_安裝部署手冊.md)
+
+* **套件組成**：
+  * **Node 1 Master 部署包**：[production-deploy/node1-master/](production-deploy/node1-master/) 內含 `deploy-node1.sh` 一鍵安裝腳本。
+  * **Node 2 Backup 部署包**：[production-deploy/node2-backup/](production-deploy/node2-backup/) 內含 `deploy-node2.sh` 一鍵安裝腳本。
+  * **雙機維運巡檢與演練工具**：[production-deploy/tools/](production-deploy/tools/) 內含 `verify-ha-cluster.sh` 與 `test-failover-drill.sh`。
+* **特色**：
+  * 支援互動式引導輸入，工程師可手動輸入自選密碼或由系統隨機安全生成。
+  * 全自動處理 Rocky Linux Docker CE 安裝、防火牆放行與核心參數調優。
+  * 自動配置 PostgreSQL 串流備援與 MinIO S3 雙向即時複寫。
+
+---
 **報告簽核：企業級 SFTP 高可用技術規劃小組**  
-**文件編號：SFTP-HA-ARCH-v5.0**
+**文件編號：SFTP-HA-ARCH-v6.0 (正式發佈版)**
 

@@ -1,0 +1,31 @@
+﻿global_defs {
+    router_id SFTP_NODE1_MASTER
+    vrrp_version 3
+}
+
+vrrp_script chk_haproxy {
+    script "/usr/bin/killall -0 haproxy || /bin/nc -z 127.0.0.1 2222"
+    interval 2
+    weight -20
+}
+
+vrrp_instance VI_DMZ {
+    state MASTER
+    interface __IFACE__
+    virtual_router_id __VRID__
+    priority 101
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass __AUTH_PASS__
+    }
+
+    virtual_ipaddress {
+        __VIP_CIDR__ dev __IFACE__ label __IFACE__:vip
+    }
+
+    track_script {
+        chk_haproxy
+    }
+}

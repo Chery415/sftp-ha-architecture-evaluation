@@ -1,0 +1,41 @@
+﻿global
+    log stdout format raw local0
+
+defaults
+    log     global
+    mode    tcp
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
+
+# SFTP HA 流量入口 (對外統一 VIP: 2222)
+frontend sftp_front
+    bind *:2222
+    mode tcp
+    default_backend sftp_back
+
+backend sftp_back
+    mode tcp
+    balance roundrobin
+    server sftpgo-1 __NODE1_IP__:2022 check inter 1000 fall 2 rise 2
+    server sftpgo-2 __NODE2_IP__:2022 check inter 1000 fall 2 rise 2
+
+# Web Client / Admin HA 流量入口 (對內統一 VIP: 8081)
+frontend web_front
+    bind *:8081
+    mode http
+    default_backend web_back
+
+backend web_back
+    mode http
+    balance roundrobin
+    server sftpgo-1 __NODE1_IP__:8080 check inter 1000 fall 2 rise 2
+    server sftpgo-2 __NODE2_IP__:8080 check inter 1000 fall 2 rise 2
+
+# HA 叢集健康儀表板 (埠號: 8404)
+frontend stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /
+    stats refresh 3s

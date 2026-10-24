@@ -1,0 +1,142 @@
+﻿version: "3.8"
+
+networks:
+  sftp-node1-net:
+    driver: bridge
+
+volumes:
+  pg-primary-data:
+  minio-1-data:
+  sftpgo-1-data:
+
+services:
+  # ==========================================
+  # 1. PostgreSQL (主資料庫 Primary)
+  # ==========================================
+  pg-primary:
+    image: postgres:15-alpine
+    container_name: sftp-postgres-primary
+    restart: unless-stopped
+    ports:
+      - "5432:5432" # 開放供 Node 2 串流複寫
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sftpgo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sftpgopassword}
+      POSTGRES_DB: ${POSTGRES_DB:-sftpgo}
+      POSTGRES_REPLICATOR_PASSWORD: ${POSTGRES_REPLICATOR_PASSWORD:-replicatorpassword}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+    volumes:
+      - ./config/postgres/01-init-replication.sh:/docker-entrypoint-initdb.d/01-init-replication.sh:ro
+      - pg-primary-data:/var/lib/postgresql/data
+    networks:
+      - sftp-node1-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sftpgo} -d ${POSTGRES_DB:-sftpgo}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ==========================================
+  # 2. MinIO S3 (節點 1 儲存體)
+  # ==========================================
+  minio-1:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: sftp-minio-1
+    restart: unless-stopped
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO Console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadminpassword}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-1-data:/data
+    networks:
+      - sftp-node1-net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9000'"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ==========================================
+  # 3. SFTPGo (節點 1 運算服務)
+  # ==========================================
+  sftpgo-1:
+    image: drakkan/sftpgo:v2.6-alpine
+    container_name: sftp-sftpgo-1
+    restart: unless-stopped
+    ports:
+      - "2022:2022" # SFTP 內部埠 (由 HAProxy 代理)
+      - "8080:8080" # Web Admin 內部埠
+    environment:
+      SFTPGO_DATA_PROVIDER__DRIVER: postgresql
+      SFTPGO_DATA_PROVIDER__NAME: ${POSTGRES_DB:-sftpgo}
+      SFTPGO_DATA_PROVIDER__HOST: pg-primary
+      SFTPGO_DATA_PROVIDER__PORT: 5432
+      SFTPGO_DATA_PROVIDER__USERNAME: ${POSTGRES_USER:-sftpgo}
+      SFTPGO_DATA_PROVIDER__PASSWORD: ${POSTGRES_PASSWORD:-sftpgopassword}
+      SFTPGO_DATA_PROVIDER__SSLMODE: 0
+      SFTPGO_SFTPD__BINDINGS__0__PORT: 2022
+      SFTPGO_HTTPD__BINDINGS__0__PORT: 8080
+      SFTPGO_DEFAULT_ADMIN_USERNAME: ${SFTPGO_ADMIN_USER:-admin}
+      SFTPGO_DEFAULT_ADMIN_PASSWORD: ${SFTPGO_ADMIN_PASSWORD:-adminpassword}
+      SFTPGO_LOG_LEVEL: info
+    volumes:
+      - sftpgo-1-data:/var/lib/sftpgo
+    networks:
+      - sftp-node1-net
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      minio-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2022 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ==========================================
+  # 4. HAProxy (本機入口負載平衡器)
+  # ==========================================
+  haproxy-1:
+    image: haproxy:2.8-alpine
+    container_name: sftp-haproxy-1
+    restart: unless-stopped
+    ports:
+      - "2222:2222" # 對外 SFTP VIP 服務埠
+      - "8081:8081" # 對內 Web 服務埠
+      - "8404:8404" # 叢集儀表板
+    volumes:
+      - ./config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - sftp-node1-net
+    depends_on:
+      sftpgo-1:
+        condition: service_healthy
+
+  # ==========================================
+  # 5. Keepalived (Master 節點 - 維護 VIP)
+  # ==========================================
+  keepalived-1:
+    image: osixia/keepalived:2.0.20
+    container_name: sftp-keepalived-1
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_BROADCAST
+      - NET_RAW
+    entrypoint: ["/bin/sh", "-c", "chmod 644 /container/service/keepalived/assets/keepalived.conf && exec /container/tool/run --copy-service"]
+    volumes:
+      - ./config/keepalived/keepalived.conf:/container/service/keepalived/assets/keepalived.conf
+    depends_on:
+      - haproxy-1
