@@ -1,0 +1,264 @@
+networks:
+  sftp-ha-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  pg-primary-data:
+  pg-standby-data:
+  minio-a-data:
+  minio-b-data:
+  sftpgo-a-data:
+  sftpgo-b-data:
+
+services:
+  # ==========================================
+  # 節點 1: PostgreSQL (主 Primary)
+  # ==========================================
+  pg-primary:
+    image: postgres:15-alpine
+    container_name: pg-primary
+    environment:
+      POSTGRES_USER: sftpgo
+      POSTGRES_PASSWORD: sftpgopassword
+      POSTGRES_DB: sftpgo
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+    volumes:
+      - ./config/postgres/01-init-replication.sh:/docker-entrypoint-initdb.d/01-init-replication.sh:ro
+      - pg-primary-data:/var/lib/postgresql/data
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.21
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sftpgo -d sftpgo"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ==========================================
+  # 節點 2: PostgreSQL (從 Standby)
+  # ==========================================
+  pg-standby:
+    image: postgres:15-alpine
+    container_name: pg-standby
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    entrypoint: ["/bin/sh", "/entrypoint-custom.sh"]
+    volumes:
+      - ./config/postgres/standby-entrypoint.sh:/entrypoint-custom.sh:ro
+      - pg-standby-data:/var/lib/postgresql/data
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.22
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==========================================
+  # 節點 1: MinIO S3 (節點 A)
+  # ==========================================
+  minio-a:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: minio-a
+    ports:
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadminpassword
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-a-data:/data
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.31
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9000'"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ==========================================
+  # 節點 2: MinIO S3 (節點 B)
+  # ==========================================
+  minio-b:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: minio-b
+    ports:
+      - "9003:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadminpassword
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-b-data:/data
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.32
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9000'"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ==========================================
+  # MinIO 自動化雙向即時複寫設定
+  # ==========================================
+  minio-init:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: minio-init
+    volumes:
+      - ./config/minio/setup-replication.sh:/setup-replication.sh:ro
+    entrypoint: ["/bin/sh", "/setup-replication.sh"]
+    networks:
+      - sftp-ha-net
+    depends_on:
+      minio-a:
+        condition: service_healthy
+      minio-b:
+        condition: service_healthy
+
+  # ==========================================
+  # 節點 1: SFTPGo (實例 A)
+  # ==========================================
+  sftpgo-a:
+    image: drakkan/sftpgo:v2.6-alpine
+    container_name: sftpgo-a
+    environment:
+      SFTPGO_DATA_PROVIDER__DRIVER: postgresql
+      SFTPGO_DATA_PROVIDER__NAME: sftpgo
+      SFTPGO_DATA_PROVIDER__HOST: pg-primary
+      SFTPGO_DATA_PROVIDER__PORT: 5432
+      SFTPGO_DATA_PROVIDER__USERNAME: sftpgo
+      SFTPGO_DATA_PROVIDER__PASSWORD: sftpgopassword
+      SFTPGO_DATA_PROVIDER__SSLMODE: 0
+      SFTPGO_SFTPD__BINDINGS__0__PORT: 2022
+      SFTPGO_HTTPD__BINDINGS__0__PORT: 8080
+      SFTPGO_LOADDATA_FROM: /etc/sftpgo/initial_data_a.json
+      SFTPGO_LOG_LEVEL: info
+    volumes:
+      - ./config/sftpgo/initial_data_a.json:/etc/sftpgo/initial_data_a.json:ro
+      - sftpgo-a-data:/var/lib/sftpgo
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.41
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      minio-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2022 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ==========================================
+  # 節點 2: SFTPGo (實例 B)
+  # ==========================================
+  sftpgo-b:
+    image: drakkan/sftpgo:v2.6-alpine
+    container_name: sftpgo-b
+    environment:
+      SFTPGO_DATA_PROVIDER__DRIVER: postgresql
+      SFTPGO_DATA_PROVIDER__NAME: sftpgo
+      SFTPGO_DATA_PROVIDER__HOST: pg-primary
+      SFTPGO_DATA_PROVIDER__PORT: 5432
+      SFTPGO_DATA_PROVIDER__USERNAME: sftpgo
+      SFTPGO_DATA_PROVIDER__PASSWORD: sftpgopassword
+      SFTPGO_DATA_PROVIDER__SSLMODE: 0
+      SFTPGO_SFTPD__BINDINGS__0__PORT: 2022
+      SFTPGO_HTTPD__BINDINGS__0__PORT: 8080
+      SFTPGO_LOADDATA_FROM: /etc/sftpgo/initial_data_b.json
+      SFTPGO_LOG_LEVEL: info
+    volumes:
+      - ./config/sftpgo/initial_data_b.json:/etc/sftpgo/initial_data_b.json:ro
+      - sftpgo-b-data:/var/lib/sftpgo
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.42
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      minio-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2022 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ==========================================
+  # 流量入口與故障移轉層 (VIP Gateway)
+  # ==========================================
+  sftp-vip-gateway:
+    image: haproxy:2.8-alpine
+    container_name: sftp-vip-gateway
+    ports:
+      - "2222:2222" # 對外 SFTP 統一 VIP
+      - "8081:8081" # 對內 Web 統一 VIP
+      - "8404:8404" # HA 狀態監控儀表板
+    volumes:
+      - ./config/gateway/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      sftpgo-a:
+        condition: service_healthy
+      sftpgo-b:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==========================================
+  # 內部 Keepalived Master 容器 (維護 172.28.0.100 VIP)
+  # ==========================================
+  keepalived-master:
+    image: osixia/keepalived:2.0.20
+    container_name: keepalived-master
+    cap_add:
+      - NET_ADMIN
+      - NET_BROADCAST
+      - NET_RAW
+    entrypoint: ["/bin/sh", "-c", "chmod 644 /container/service/keepalived/assets/keepalived.conf && exec /container/tool/run --copy-service"]
+    volumes:
+      - ./config/keepalived/keepalived-master.conf:/container/service/keepalived/assets/keepalived.conf
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.11
+    depends_on:
+      - sftpgo-a
+    restart: unless-stopped
+
+  # ==========================================
+  # 內部 Keepalived Backup 容器 (維護 172.28.0.100 VIP)
+  # ==========================================
+  keepalived-backup:
+    image: osixia/keepalived:2.0.20
+    container_name: keepalived-backup
+    cap_add:
+      - NET_ADMIN
+      - NET_BROADCAST
+      - NET_RAW
+    entrypoint: ["/bin/sh", "-c", "chmod 644 /container/service/keepalived/assets/keepalived.conf && exec /container/tool/run --copy-service"]
+    volumes:
+      - ./config/keepalived/keepalived-backup.conf:/container/service/keepalived/assets/keepalived.conf
+    networks:
+      sftp-ha-net:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      - sftpgo-b
+    restart: unless-stopped
